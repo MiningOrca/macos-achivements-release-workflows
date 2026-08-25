@@ -1,0 +1,175 @@
+name: macOS Achievement Patcher Release
+
+on:
+  workflow_call:
+    inputs:
+      script_path:
+        description: Source patcher path in the caller repository
+        required: true
+        type: string
+      asset_name:
+        description: Filename to publish in the GitHub Release
+        required: true
+        type: string
+      label:
+        description: Mining Orca status label
+        required: true
+        type: string
+    secrets:
+      MINING_ORCA_TOKEN:
+        required: true
+
+permissions:
+  contents: write
+  pull-requests: read
+
+concurrency:
+  group: release-${{ github.repository }}
+  cancel-in-progress: false
+
+jobs:
+  release:
+    runs-on: macos-latest
+
+    steps:
+      - name: Checkout patcher
+        uses: actions/checkout@v7
+        with:
+          path: app
+          fetch-depth: 0
+          persist-credentials: false
+
+      - name: Checkout private Mining Orca
+        uses: actions/checkout@v7
+        with:
+          repository: MiningOrca/mining-orca-banner
+          token: ${{ secrets.MINING_ORCA_TOKEN }}
+          path: orca
+          persist-credentials: false
+
+      - name: Build Mining Orca
+        shell: bash
+        run: |
+          set -euo pipefail
+          chmod +x orca/build.sh orca/assemble.sh
+          ./orca/build.sh
+
+      - name: Determine release version
+        id: version
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+
+          existing="$(
+            git -C app tag --points-at "$GITHUB_SHA" |
+              grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+              head -n 1 || true
+          )"
+
+          if [[ -n "$existing" ]]; then
+            next="$existing"
+            kind="existing"
+          else
+            latest="$(
+              git -C app tag --list 'v*' --sort=-v:refname |
+                grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' |
+                head -n 1 || true
+            )"
+
+            if [[ -z "$latest" ]]; then
+              next="v1.0.0"
+              kind="initial"
+            else
+              version="${latest#v}"
+              IFS='.' read -r major minor patch <<< "$version"
+
+              merged_prs="$(
+                gh api \
+                  -H "Accept: application/vnd.github+json" \
+                  "/repos/${GITHUB_REPOSITORY}/commits/${GITHUB_SHA}/pulls" \
+                  --jq '[.[] | select(.merged_at != null and .base.ref == "main")] | length'
+              )"
+
+              if (( merged_prs > 0 )); then
+                next="v${major}.$((minor + 1)).0"
+                kind="merge"
+              else
+                next="v${major}.${minor}.$((patch + 1))"
+                kind="push"
+              fi
+            fi
+          fi
+
+          printf 'Release kind: %s\n' "$kind"
+          printf 'Release version: %s\n' "$next"
+          printf 'tag=%s\n' "$next" >> "$GITHUB_OUTPUT"
+
+      - name: Assemble standalone patcher
+        shell: bash
+        env:
+          SCRIPT_PATH: ${{ inputs.script_path }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+          ORCA_LABEL: ${{ inputs.label }}
+        run: |
+          set -euo pipefail
+
+          mkdir -p release
+
+          ./orca/assemble.sh \
+            "./app/$SCRIPT_PATH" \
+            "$ORCA_LABEL" \
+            "./release/$ASSET_NAME"
+
+      - name: Validate release asset
+        shell: bash
+        env:
+          SCRIPT_PATH: ${{ inputs.script_path }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+
+          test -s "./release/$ASSET_NAME"
+          bash -n "./release/$ASSET_NAME"
+
+          grep -q 'BEGIN EMBEDDED MINING ORCA' \
+            "./release/$ASSET_NAME"
+
+          ! grep -q 'BEGIN EMBEDDED MINING ORCA' \
+            "./app/$SCRIPT_PATH"
+
+      - name: Create SHA-256
+        shell: bash
+        env:
+          ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+
+          cd release
+          shasum -a 256 "$ASSET_NAME" > "$ASSET_NAME.sha256"
+
+      - name: Create or update GitHub Release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          TAG: ${{ steps.version.outputs.tag }}
+          ASSET_NAME: ${{ inputs.asset_name }}
+        run: |
+          set -euo pipefail
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" \
+              "./release/$ASSET_NAME" \
+              "./release/$ASSET_NAME.sha256" \
+              --clobber
+          else
+            gh release create "$TAG" \
+              "./release/$ASSET_NAME" \
+              "./release/$ASSET_NAME.sha256" \
+              --target "$GITHUB_SHA" \
+              --title "$TAG" \
+              --notes "Download $ASSET_NAME below."
+          fi
